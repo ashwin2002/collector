@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import storage
 import cao
+import capella_pipeline as cap
 from config import (
     ViewConfig, P1,
     DEFAULT_ARCHITECTURE, DEFAULT_SERVER_TYPE,
@@ -156,27 +157,26 @@ def _build_ids_for_job(res: Dict, executor: bool) -> List[int]:
     return ids
 
 
-def _fetch_failed_tests(build_url: str) -> list:
-    """Failed test-cases (name/class/suite/status/duration/error/stacktrace) from a
-    Jenkins build's testReport. Used to power the greenboard capella fail popup."""
+def _fetch_test_results(build_url: str) -> Tuple[list, list]:
+    """(passed, failed) test-cases from a Jenkins build's testReport."""
     try:
         data = _jk().get_json(f"{build_url}/testReport", {"depth": 0})
     except Exception:
-        return []
+        return [], []
     if not data:
-        return []
-    out = []
+        return [], []
+    passed, failed = [], []
     for suite in (data.get("suites") or []):
         sname = suite.get("name")
         for c in (suite.get("cases") or []):
-            if c.get("status") == "PASSED":
-                continue
-            out.append({
+            case = {
                 "name": c.get("name"), "className": c.get("className"), "suite": sname,
                 "status": c.get("status"), "duration": c.get("duration"),
-                "errorDetails": c.get("errorDetails"), "errorStackTrace": c.get("errorStackTrace"),
-            })
-    return out
+                "errorDetails": c.get("errorDetails"),
+                "errorStackTrace": c.get("errorStackTrace"),
+            }
+            (passed if c.get("status") == "PASSED" else failed).append(case)
+    return passed, failed
 
 
 # ---------------------------------------------------------------------------
@@ -499,6 +499,14 @@ class ServerProcessor:
 # ---------------------------------------------------------------------------
 
 class CapellaProcessor:
+    """
+    Capella jobs, including the pipeline context the legacy board was built around.
+
+    Unlike the server board, a Capella result is only meaningful together with the
+    PIPELINE that launched it: the pipeline carries the environment, the control-plane
+    version, and — for jobs that pass no version of their own — the cluster version.
+    See capella_pipeline for the identity/version rules and the dispatcher indirection.
+    """
 
     _SKIP_NAMES = re.compile(
         r"SERVERLESS|DAPI|NEBULA|ELIXIR", re.IGNORECASE
@@ -523,19 +531,137 @@ class CapellaProcessor:
             storage.purge_disabled_job(job_doc.name, res.get("builds", []), view.bucket)
             return
 
+        # A dispatcher build has no test results of its own — it exists only to publish
+        # the descriptor -> pipeline mapping that executor builds resolve through. It
+        # must therefore be collected BEFORE the executor jobs in the same cycle
+        # (main.py orders the capella tasks accordingly).
+        if "dispatcher" in job_doc.name.lower():
+            self._process_dispatcher_job(job_doc, url, view, res, already_scraped)
+            return
+
         executor = is_executor(job_doc.name)
         bids     = _build_ids_for_job(res, executor)
         build_hist: Dict[str, int] = {}
+        consecutive_missing = 0
 
+        # Same retention-boundary walk as the server path, which this processor was
+        # missing. For an executor, _build_ids_for_job() expands firstBuild..lastBuild
+        # — thousands of ids for test_suite_executor_cloud-TAF while Jenkins keeps only
+        # a few hundred — so without the early stop every cycle re-requested builds
+        # that are permanently 404, on every poll.
         for bid in bids:
+            scraped_key = job_doc.url + str(bid)
+            if scraped_key in already_scraped:
+                consecutive_missing = 0      # this build exists, just already done
+                continue
+            status, build_res = ServerProcessor._wait_for_build(url, bid)
+            if status == "missing":
+                # Only a confirmed 404 counts toward the boundary: walking
+                # newest->oldest, once this many builds are truly gone, so is the rest.
+                consecutive_missing += 1
+                if executor and consecutive_missing >= STOP_AFTER_MISSING_BUILDS:
+                    logger.info("%s: %d consecutive missing builds at #%d — past retention, "
+                                "stopping walk", job_doc.name, consecutive_missing, bid)
+                    break
+                continue
+            if status != "ok":
+                # Transient error or still running — not confirmed gone, so it must
+                # not advance the boundary. Retry next cycle.
+                continue
+            consecutive_missing = 0
             try:
-                self._process_build(bid, job_doc, url, view, already_scraped, build_hist, executor)
+                self._process_build(bid, build_res, job_doc, url, view,
+                                    already_scraped, build_hist, executor)
             except Exception as exc:
                 logger.exception("Capella error %s build %d: %s", job_doc.name, bid, exc)
+
+    # ------------------------------------------------------------------
+    # Dispatcher: descriptor -> pipeline map
+    # ------------------------------------------------------------------
+
+    def _process_dispatcher_job(self, job_doc: JobDoc, url: str, view: ViewConfig,
+                                res: Dict, already_scraped: Any) -> None:
+        for bid in _build_ids_for_job(res, False):
+            # Namespaced so a dispatcher build never collides with a test build of the
+            # same number in the shared already_scraped list.
+            scraped_key = f"dispatcher::{job_doc.url}{bid}"
+            if scraped_key in already_scraped:
+                continue
+            status, build_res = ServerProcessor._wait_for_build(url, bid)
+            if status != "ok":
+                continue
+            pipeline = cap.upstream_from_causes(build_res.get("actions"))
+            descriptors = cap.descriptors_from_console(
+                _jk().stream_console_lines(f"{url}{bid}")
+            )
+            if not descriptors:
+                continue
+            cap.store_dispatcher(view.bucket, job_doc.name, bid, pipeline, descriptors)
+            already_scraped.append(scraped_key)
+            logger.debug("dispatcher %s/%d -> %d descriptors", job_doc.name, bid,
+                         len(descriptors))
+
+    # ------------------------------------------------------------------
+    # Pipeline document (cached in the pipeline collection, like legacy)
+    # ------------------------------------------------------------------
+
+    def _pipeline_doc(self, view: ViewConfig, root: str, name: Optional[str],
+                      build_id: Optional[int], pipeline_url: Optional[str]
+                      ) -> Optional[Dict[str, Any]]:
+        if not name or not build_id:
+            return None
+        key = cap.doc_id(name, build_id)
+        existing = storage.get_scoped(view.bucket, cap.SCOPE, cap.PIPELINE_COLLECTION, key)
+        if existing and existing.get("result"):
+            return existing                    # already captured, and it finished
+
+        rel = (pipeline_url or f"job/{name}/").lstrip("/")
+        res = _jk().get_json(f"{root}{rel}{build_id}", {"depth": 0})
+        if not res:
+            return existing
+        params   = extract_params(res.get("actions"))
+        run_date = res.get("timestamp") or 0
+        cp_version, commit_url = cap.cp_version_from_params(
+            params, run_date, cap.github_token(), fetch_commit=cap.fetch_commit_sha)
+        doc = {
+            "name":        name,
+            "buildId":     build_id,
+            "url":         res.get("url"),
+            "environment": cap.get_param(params, cap.ENVIRONMENT_PARAMS) or "sbx",
+            "cpVersion":   cp_version,
+            "cbVersion":   cap.cb_version_from_params(params),
+            "commitUrl":   commit_url,
+            "result":      res.get("result"),
+            "runDate":     run_date,
+            "duration":    res.get("duration"),
+            "description": res.get("description"),
+            "jobs":        (existing or {}).get("jobs") or {},
+        }
+        storage.upsert_scoped(view.bucket, cap.SCOPE, cap.PIPELINE_COLLECTION, key, doc)
+        return doc
+
+    def _resolve_pipeline(self, view: ViewConfig, root: str, job_name: str,
+                          actions: Any, params: Any) -> Optional[Dict[str, Any]]:
+        """
+        The pipeline that launched this build. test_suite_executor* builds are launched
+        by the dispatcher and only carry a `descriptor`, so they resolve through the
+        dispatcher collection; everything else names its pipeline in causes.
+        """
+        if is_executor(job_name):
+            descriptor = get_action(params, "name", "descriptor")
+            if not descriptor:
+                return None
+            name, purl, pbid = cap.pipeline_for_descriptor(view.bucket, descriptor)
+        else:
+            name, purl, pbid = cap.upstream_from_causes(actions)
+        if not name or name == job_name:
+            return None                        # direct run, or a rebuild of itself
+        return self._pipeline_doc(view, root, name, pbid, purl)
 
     def _process_build(
         self,
         bid: int,
+        res: Dict,
         job_doc: JobDoc,
         url: str,
         view: ViewConfig,
@@ -544,12 +670,6 @@ class CapellaProcessor:
         executor: bool,
     ) -> None:
         scraped_key = job_doc.url + str(bid)
-        if scraped_key in already_scraped:
-            return
-
-        status, res = ServerProcessor._wait_for_build(url, bid)
-        if status != "ok":
-            return
 
         doc = job_doc.copy()
         doc.build_id  = bid
@@ -576,10 +696,17 @@ class CapellaProcessor:
         doc.total_count = total_count - skip_count
         doc.fail_count  = fail_count
 
-        # Resolve OS and component directly from params — no translation table.
-        doc.os, doc.component = resolve_os_and_component(
+        # Component is read RAW — deliberately NOT uppercased like the server path —
+        # because every Capella component already in capella_gb is the raw param
+        # ("smoke_capella", "capella_fusion", "columnar"). Uppercasing forks each one
+        # into a second board section that never joins its own history, which is how
+        # SMOKE_CAPELLA ended up sitting alongside the legacy smoke_capella.
+        # The job-name fallback is the small capella table, not the server FEATURES list.
+        doc.os, _ = resolve_os_and_component(
             params, doc.name, view, fallback_os=doc.os
         )
+        doc.component     = cap.resolve_component(params, doc.name)
+        doc.sub_component = get_action(params, "name", "subcomponent")
 
         arch = get_action(params, "name", "arch")
         if arch and arch != DEFAULT_ARCHITECTURE and doc.os:
@@ -591,39 +718,36 @@ class CapellaProcessor:
                 return
             doc.os = server_type.split("_")[0].upper()
 
-        if not doc.os or doc.os in ("AWS", "PROVISIONED"):
-            provider = get_action(params, "name", "provider")
-            doc.os = (provider.upper() if provider
-                      else resolve_capella_platform(doc.name, view))
+        # Provider is the Capella board's OS axis, and it drives the job name below, so
+        # it is resolved the way the legacy pipeline collector did: explicit param, else
+        # inferred from the scenario/spec or the job name, else aws.
+        provider = cap.resolve_provider(params, doc.name)
+        doc.provider = provider.upper()
+        # Any os value that isn't one of the view's platforms has to become one. Checking
+        # only ("AWS", "PROVISIONED") let other server_type values through as if they
+        # were platforms: the sdk-*-integration-capella jobs pass server_type=CAPELLA and
+        # landed under a bogus "CAPELLA" platform column.
+        if not doc.os or doc.os not in view.platforms:
+            doc.os = doc.provider if doc.provider in view.platforms else \
+                resolve_capella_platform(doc.name, view)
 
-        # Special job overrides
-        if doc.name == "cp-cli-runner":
-            scenario = get_action(params, "name", "SCENARIO")
-            if scenario:
-                doc.component = "CP_CLI"
-                stem = scenario.split("/")[-1].split(".")[0]
-                doc.name = stem
-                doc.os = stem.split("-")[0].upper()
-                if doc.os not in view.platforms:
-                    doc.os = resolve_capella_platform(doc.name, view)
-        elif doc.name == "UI-Automation-V2":
-            spec = get_action(params, "name", "SPEC")
-            if spec and "SERVERLESS" in spec.upper():
-                doc.os = "SERVERLESS"
-            else:
-                csp = get_action(params, "name", "CLOUD_SERVICE_PROVIDER")
-                doc.os = csp.upper() if csp else "AWS"
-
-        if not doc.component:
-            suite = get_action(params, "name", "suite_type")
-            if suite:
-                doc.component = suite.upper()
+        # UI / CP-CLI are generic runners: one project, one build per spec/scenario.
+        # Without the suffix every spec collapses onto a single job key.
+        spec = cap.get_param(params, ["SPEC", "SCENARIO"])
+        if spec and "SERVERLESS" in str(spec).upper():
+            return
+        # Match the runner names precisely. A bare "UI" substring test (what legacy
+        # used) also fires on test_s-UI-te_executor, which is harmless only because
+        # the executor happens to carry no SPEC/SCENARIO param.
+        upper_name = doc.name.upper()
+        if "UI-AUTOMATION" in upper_name or "CP-CLI" in upper_name:
+            suffix = cap.spec_suffix(spec)
+            if suffix:
+                doc.name = f"{doc.name}_{suffix}"
 
         # Same gate as the server path: a real Capella result must resolve to a
-        # component. Capella's OS defaults to "AWS" so an OS check is useless here —
-        # but a personal/dev Cloud-view project that runs without a component (or
-        # suite_type) param would otherwise be stored with component="" and leak into
-        # the capella board, exactly like py3_kushagra_* did on the server board.
+        # component, or it is a personal/dev Cloud-view project that never belonged on
+        # the board (exactly like py3_kushagra_* on the server board).
         if not doc.component:
             logger.debug("Skipping capella %s/%d — unresolved component (not a real test job)",
                          job_doc.name, bid)
@@ -632,26 +756,60 @@ class CapellaProcessor:
         if doc.os == "SERVERLESS":
             return
 
-        provider = get_action(params, "name", "provider")
-        doc.provider = provider.upper() if provider else resolve_capella_platform(doc.name, view)
+        root = url.split("/job/")[0] + "/" if "/job/" in url else url
+        pipeline = self._resolve_pipeline(view, root, job_doc.name, actions, params)
+
+        # Per-suite identity for the cloud executor, matching the legacy board:
+        # "<provider>-<component>-<subcomponent>", then prefixed with the provider
+        # again (the doubling is legacy's, and keeping it is what lets new runs join
+        # the per-suite history already folded into capella_gb).
+        if executor and doc.component and doc.sub_component:
+            doc.name = f"{provider}-{doc.component}-{doc.sub_component}"
+        doc.name = f"{provider}_{doc.name}"
 
         doc.env = (get_env_from_params(params, view.env_param_names) or "").upper() or None
+        if not doc.env and pipeline:
+            doc.env = str(pipeline.get("environment") or "").upper() or None
 
-        # Control-plane version (secondary attribute; best-effort — may be absent on
-        # a given test job's params). Kept per-run so the board can show/filter it
-        # without it becoming a build-grouping axis (cbVersion is the build axis).
-        for _cp in ("cp_version", "pr_commit", "Version", "cp_branch", "CP_VERSION"):
-            _cpv = get_action(params, "name", _cp)
-            if _cpv:
-                doc.cp_version = _cpv
-                break
+        # Control-plane version. The job rarely carries it; the pipeline always does,
+        # and it is the pipeline's control plane the job actually ran against.
+        if pipeline and pipeline.get("cpVersion"):
+            doc.cp_version = pipeline["cpVersion"]
+        else:
+            for _cp in ("cp_version", "pr_commit", "Version", "cp_branch", "CP_VERSION"):
+                _cpv = get_action(params, "name", _cp)
+                if _cpv:
+                    doc.cp_version = _cpv
+                    break
 
-        # Build version
-        doc.build, doc.priority = get_build_and_priority(params, view.build_param_names)
-        if not doc.build:
-            doc.build = get_build_from_image(params, view.image_param_names)
-        if not doc.build:
-            logger.warning("Cannot determine build for %s/%d, skipping", doc.name, bid)
+        # Pipeline context, so the board can group runs by the pipeline that produced
+        # them instead of showing them as unrelated jobs.
+        if pipeline:
+            doc.pipeline_job = pipeline.get("name")
+            doc.pipeline_url = pipeline.get("url")
+            doc.pipeline_id  = cap.doc_id(pipeline.get("name"), pipeline.get("buildId"))
+
+        # cbVersion, in legacy precedence: the job's own server_version, else the
+        # pipeline's (this is the ONLY source for cp-cli-runner and the sdk-* jobs,
+        # which pass no version at all), else the generic build params, else "default".
+        doc.build = cap.cb_version_from_params(params)
+        if doc.build == cap.DEFAULT_CB_VERSION and pipeline:
+            doc.build = pipeline.get("cbVersion") or cap.DEFAULT_CB_VERSION
+        if doc.build == cap.DEFAULT_CB_VERSION:
+            fallback, doc.priority = get_build_and_priority(
+                params, view.build_param_names, allow_bare=True)
+            doc.build = fallback or get_build_from_image(
+                params, view.image_param_names) or cap.DEFAULT_CB_VERSION
+        if doc.build == cap.DEFAULT_CB_VERSION:
+            # Nothing anywhere gives this run a cluster version — the job passes none
+            # and its pipeline build has aged out of Jenkins (the pipeline is wiped
+            # independently of the job it launched). The Capella board is version-first,
+            # so there is nowhere meaningful to file it; both legacy collectors skipped
+            # this case rather than inventing a "default" build, which would otherwise
+            # show up as a real entry in the board's build dropdown.
+            logger.info("Skipping capella %s/%d — no cluster version (pipeline %s gone)",
+                        doc.name, bid,
+                        (pipeline or {}).get("name") or "unresolved")
             return
 
         doc.component = caveat_swap_xdcr(doc.build, doc.component or "")
@@ -667,8 +825,13 @@ class CapellaProcessor:
         doc.triage, doc.bugs = storage.get_triage_and_bugs(
             view.bucket, doc.display_name or doc.name, doc.build)
 
+        # Capella sets dedup_runs_per_build=False: every run of a suite against a
+        # released version is real history the board is meant to show, so a repeat of
+        # (name, build) must NOT delete the earlier run. With the collapsed job name
+        # this was catastrophic — every suite shared one key, so a cold walk deleted
+        # almost every build it had just read.
         hist_key = doc.name + "-" + doc.build
-        if hist_key in build_hist:
+        if view.dedup_runs_per_build and hist_key in build_hist:
             storage.remove(view.bucket, storage.make_key(doc.name, bid))
             return
 
@@ -676,17 +839,57 @@ class CapellaProcessor:
         if storage.upsert(view.bucket, key, doc.to_dict()):
             build_hist[hist_key] = bid
             already_scraped.append(scraped_key)
-            # Capture failed test-cases for the greenboard fail popup (failures only).
-            # Stored in `<bucket>._default.jobs`, keyed name+buildId — same collection
-            # the historical mirror uses, so one endpoint serves live + backfilled runs.
-            if (doc.fail_count or 0) > 0:
-                failed = _fetch_failed_tests(url + str(bid))
-                if failed:
-                    storage.upsert_scoped(view.bucket, "_default", "jobs",
-                                          f"ft::{doc.name}::{bid}",
-                                          {"name": doc.name, "buildId": bid, "failedTests": failed})
+            self._store_job_details(view, doc, bid, url, pipeline, total_count, fail_count)
         else:
             storage.write_error(str(doc.to_dict()))
+
+    # ------------------------------------------------------------------
+    # jobs collection — legacy schema (also powers the fail popup)
+    # ------------------------------------------------------------------
+
+    def _store_job_details(self, view: ViewConfig, doc: JobDoc, bid: int, url: str,
+                           pipeline: Optional[Dict[str, Any]], total_count: int,
+                           fail_count: int) -> None:
+        """
+        Mirror the run into `<bucket>._default.jobs` with the schema the legacy
+        pipeline collector used, and register it on its pipeline doc. greenboard reads
+        this collection for the per-test fail popup; keeping the legacy shape means one
+        endpoint serves live and historical runs alike.
+        """
+        passed, failed = _fetch_test_results(url + str(bid))
+        job_doc_out = {
+            "name":           doc.name,
+            "buildId":        bid,
+            "url":            f"{url}{bid}/",
+            "result":         doc.result,
+            "totalCount":     total_count,
+            "failCount":      fail_count,
+            "passCount":      total_count - fail_count,
+            "runDate":        doc.timestamp,
+            "duration":       doc.duration,
+            "provider":       doc.provider,
+            "component":      doc.component,
+            "passedTests":    passed,
+            "failedTests":    failed,
+        }
+        if pipeline:
+            job_doc_out["pipelineID"]     = doc.pipeline_id
+            job_doc_out["pipelineJob"]    = pipeline.get("name")
+            job_doc_out["pipelineJobUrl"] = pipeline.get("url")
+        storage.upsert_scoped(view.bucket, cap.SCOPE, cap.JOBS_COLLECTION,
+                              cap.doc_id(doc.name, bid), job_doc_out)
+
+        # Record the run on its pipeline so the board can list a pipeline's jobs.
+        if not pipeline or not pipeline.get("name"):
+            return
+        jobs = pipeline.setdefault("jobs", {})
+        builds = jobs.setdefault(doc.name, [])
+        if bid not in builds:
+            builds.append(bid)
+            builds.sort()
+            storage.upsert_scoped(
+                view.bucket, cap.SCOPE, cap.PIPELINE_COLLECTION,
+                cap.doc_id(pipeline["name"], pipeline["buildId"]), pipeline)
 
 
 # ---------------------------------------------------------------------------

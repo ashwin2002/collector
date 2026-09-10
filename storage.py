@@ -86,6 +86,35 @@ def upsert_scoped(bucket: str, scope: str, collection: str, key: str, doc: Dict[
         return False
 
 
+def get_scoped(bucket: str, scope: str, collection: str, key: str) -> Optional[Dict[str, Any]]:
+    """Read one doc from a specific scope.collection (e.g. capella._default.pipeline)."""
+    try:
+        return _scoped_col(bucket, scope, collection).get(key).content_as[dict]
+    except Exception:
+        return None
+
+
+def query(statement: str, *positional: Any) -> List[Dict[str, Any]]:
+    """
+    Run a N1QL query on the worker's cluster handle.
+
+    Needed by the Capella pipeline linkage: a test_suite_executor build names its
+    dispatcher only through its `descriptor` param, so the owning pipeline is found by
+    matching that descriptor against the `dispatched` array of the dispatcher docs.
+    That is an inherently query-shaped lookup (no derivable document key).
+    """
+    if _cluster is None:
+        raise RuntimeError("Storage not initialised — call init_worker() first")
+    try:
+        from couchbase.options import QueryOptions
+        opts = QueryOptions(positional_parameters=list(positional)) if positional else None
+        res = _cluster.query(statement, opts) if opts else _cluster.query(statement)
+        return list(res.rows())
+    except Exception as exc:
+        logger.warning("query failed (%s): %s", statement[:90], exc)
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Key helpers
 # ---------------------------------------------------------------------------

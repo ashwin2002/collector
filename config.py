@@ -34,6 +34,13 @@ class ViewConfig:
     urls: List[str]
     bucket: str
     platforms: Dict[str, str]          # {token: canonical} — OS fallback only
+    # Keep only ONE run per (job, build) within a collection pass, deleting the rest.
+    # Correct for the server board (a build is a point in time; a rerun supersedes),
+    # WRONG for Capella: Capella re-runs the same suite against a *released* version
+    # continuously, so (job, build) legitimately holds a long run history — the board
+    # is time-window based and counts runs. The eventing fold already dedups on
+    # build_id, so nothing here can create duplicates; removal only destroys history.
+    dedup_runs_per_build: bool         = True
     build_param_names: List[str]       = field(default_factory=list)
     image_param_names: List[str]       = field(default_factory=list)
     env_param_names: List[str]         = field(default_factory=list)
@@ -84,6 +91,7 @@ OPERATOR_PLATFORMS: Dict[str, str] = {
 }
 
 
+
 # ---------------------------------------------------------------------------
 # Views
 # ---------------------------------------------------------------------------
@@ -96,14 +104,35 @@ _EXCLUDE_TMP: List[re.Pattern] = [
 CAPELLA_VIEW = ViewConfig(
     name="capella",
     urls=[
+        # PipelineJobs is the view the legacy pipeline collector walked, and it is the
+        # only one that lists the pipeline-driven jobs plus the dispatcher:
+        # capella_provisioned_v4_api_TAF (API_TESTS), security_capella_*_TAF (SECURITY),
+        # terraform-test (TERRAFORM), the five sdk-* jobs, cp-cli-*, Perf-*. None of
+        # those appear in view/Cloud, which is why those components vanished from the
+        # board. It must come FIRST so test_suite_dispatcher_cloud is discovered before
+        # the executor jobs that resolve their pipeline through it.
+        "http://qe-jenkins1.sc.couchbase.com/view/PipelineJobs/",
         "http://qe-jenkins1.sc.couchbase.com/view/Cloud/",
-        "http://qa.sc.couchbase.com/view/Capella",
+        # NOTE: qa.sc.couchbase.com/view/Capella no longer exists (its api/json returns
+        # the Jenkins 404 page), so it is dropped rather than retried every cycle.
     ],
     bucket="capella",
     platforms=CAPELLA_PLATFORMS,
+    dedup_runs_per_build=False,
+    # Order is resolution precedence. The first five are build-numbered params
+    # ("7.6.12-0000") and stay first so the executor keeps its exact build. The rest
+    # are the release-style params the plain Capella projects send with no build
+    # number — UI-Automation-V2 sends full_server_version/SERVER_VERSION, the sdk-*
+    # jobs send VERSION, capella_volume and Perf-Provisioned-Pipeline send `version`.
+    # They only resolve because CapellaProcessor parses builds with allow_bare=True.
+    # `full_server_version` precedes `SERVER_VERSION` because the latter is often
+    # 2-part ("8.0") where the former is already the full release ("8.0.0").
     build_param_names=["version_number", "cluster_version", "build",
-                       "COUCHBASE_SERVER_VERSION", "CB_VERSION"],
+                       "COUCHBASE_SERVER_VERSION", "CB_VERSION",
+                       "cbs_version", "full_server_version", "SERVER_VERSION",
+                       "server_version", "VERSION", "version"],
     image_param_names=["IMAGE", "image", "image_name", "cbs_image", "cb_image"],
+
     env_param_names=["CYPRESS_BASE_URL", "Environment", "CP_CLI_APIURL",
                      "capella_api_url", "ENV_URL", "CP_API_URL",
                      "public_api_url", "CP_URL", "URL", "url"],

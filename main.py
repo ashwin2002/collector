@@ -28,6 +28,7 @@ from threading import Thread
 from typing import Any, Dict, List, Optional
 
 import config, storage
+import capella_pipeline as cap
 from config import ViewConfig
 from jenkins import JenkinsClient
 from models import JobDoc
@@ -97,6 +98,9 @@ def _worker_init(
     )
     set_jenkins_client(client)
     set_gb_label_map(gb_label_map or {})
+    # Capella control-plane versions come from the couchbase-cloud repo when a pipeline
+    # pins no explicit version; the PAT lives in the same credentials.ini.
+    cap.set_github_token(cap.load_github_token(credentials_path))
 
 
 def _load_gb_label_map() -> Dict:
@@ -502,8 +506,18 @@ def run(credentials_path: str = "credentials.ini") -> None:
 
                     elif view.bucket == "capella":
                         tasks = _discover_capella_jobs(view, bucket_scraped)
-                        logger.info("  %d capella jobs to process", len(tasks))
-                        _run_pool(pool, _run_capella, tasks, "capella")
+                        # test_suite_executor* builds find their pipeline only through
+                        # the dispatcher's descriptor map, so the dispatcher jobs must
+                        # be fully collected BEFORE the rest. pool.map runs a batch
+                        # concurrently, so they need their own batch — not just to be
+                        # first in one list.
+                        disp = [t for t in tasks if "dispatcher" in t.job_doc.name.lower()]
+                        rest = [t for t in tasks if t not in disp]
+                        logger.info("  %d capella jobs to process (%d dispatcher first)",
+                                    len(tasks), len(disp))
+                        if disp:
+                            _run_pool(pool, _run_capella, disp, "capella-dispatcher")
+                        _run_pool(pool, _run_capella, rest, "capella")
 
                     else:
                         tasks = _discover_server_jobs(view, bucket_scraped, capella_urls)

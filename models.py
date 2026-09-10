@@ -17,6 +17,11 @@ class JobDoc:
     # --- classification ---
     os: Optional[str] = None
     component: Optional[str] = None
+    # Raw `subcomponent` param. Kept on the doc so a mis-named run can be re-keyed
+    # offline later: the Capella naming bug was unrecoverable for a month of data
+    # precisely because subcomponent was never persisted and Jenkins only retains
+    # ~100 builds, so the per-suite identity could not be reconstructed after the fact.
+    sub_component: Optional[str] = None
     # Curated greenboard display section (from QE-Test-Suites catalog). The eventing
     # nests by `gb_label || component`, so this overrides the displayed grouping while
     # leaving `component` as the raw truth. Absent => greenboard uses `component`.
@@ -47,6 +52,12 @@ class JobDoc:
     server_version: Optional[str] = None
     sync_gateway_version: Optional[str] = None
     cp_version: Optional[str] = None
+    # Pipeline context. A Capella run is only meaningful with the pipeline that
+    # launched it (it owns the environment, control-plane version and cluster version),
+    # and the board groups runs by pipeline.
+    pipeline_job: Optional[str] = None
+    pipeline_url: Optional[str] = None
+    pipeline_id: Optional[str] = None
     env: Optional[str] = None
     provider: Optional[str] = None
 
@@ -76,6 +87,8 @@ class JobDoc:
             d["variants"] = self.variants
         if self.gb_label is not None:
             d["gb_label"] = self.gb_label
+        if self.sub_component is not None:
+            d["subComponent"] = self.sub_component
         if self.display_name is not None:
             d["displayName"] = self.display_name
         if self.server_version is not None:
@@ -84,6 +97,12 @@ class JobDoc:
             d["sync_gateway_version"] = self.sync_gateway_version
         if self.cp_version is not None:
             d["cp_version"] = self.cp_version
+        if self.pipeline_job is not None:
+            d["pipeline_job"] = self.pipeline_job
+        if self.pipeline_url is not None:
+            d["pipeline_url"] = self.pipeline_url
+        if self.pipeline_id is not None:
+            d["pipeline_id"] = self.pipeline_id
         if self.env is not None:
             d["env"] = self.env
         if self.provider is not None:

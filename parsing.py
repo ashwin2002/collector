@@ -27,6 +27,10 @@ logger = logging.getLogger(__name__)
 
 _ASCII_CTRL  = re.compile(r"[^ -~]+")
 _VERSION_RE  = re.compile(r"^\d\.\d\.\d{1,5}")
+# Bare release with no build number, anchored at BOTH ends so loose junk
+# ('default', '7.6.3)_smoke(true') is rejected rather than becoming a build doc.
+_BARE_VERSION_RE = re.compile(r"^\d+\.\d+\.\d{1,5}$")
+
 _BUILD_NO_RE = re.compile(r"^\d{1,10}")
 _TICKET_RE   = re.compile(r"([A-Z]{2,4}[-: ]*\d{4,5})")
 
@@ -106,13 +110,35 @@ def build_is_finished(res: Optional[Dict]) -> bool:
 # Version normalisation
 # ---------------------------------------------------------------------------
 
-def parse_build_version(raw: str) -> Optional[str]:
-    """Normalise a raw version string to 'X.Y.Z-NNNN'."""
+def parse_build_version(raw: str, allow_bare: bool = False) -> Optional[str]:
+    """
+    Normalise a raw version string to 'X.Y.Z-NNNN'.
+
+    `allow_bare` additionally accepts a release with no build number ('7.6.5', '8.0')
+    and returns it normalised to three parts ('7.6.5', '8.0.0'). That is the Capella
+    convention: Capella tests run against a *released* cluster version, so most of its
+    jobs pass `version`/`SERVER_VERSION`/`full_server_version` with no build number,
+    and the legacy board keyed those runs on the bare release (26 of the build docs in
+    capella_gb are bare — 13k UI runs sit under build='7.6.5'). Rejecting them is why
+    every non-executor Capella job currently fails the build gate and disappears.
+
+    Still validated strictly: the legacy collector's loose parse is what put junk build
+    docs like 'default' and '7.6.3)_smoke(true' into capella_gb, and those become real
+    (empty) entries in the board's build dropdown.
+    """
     raw = raw.replace("-rel", "").split(",")[0].strip()
     try:
         parts = raw.split("-")
         if len(parts) < 2:
-            return None
+            if not allow_bare:
+                return None
+            rel = parts[0]
+            while rel.count(".") < 2:
+                rel += ".0"
+            if not _BARE_VERSION_RE.match(rel):
+                logger.debug("Unsupported bare version string: %s", raw)
+                return None
+            return rel
         rel, bno = parts[0], parts[1]
         while rel.count(".") < 2:
             rel += ".0"
@@ -126,14 +152,14 @@ def parse_build_version(raw: str) -> Optional[str]:
 
 
 def get_build_and_priority(
-    params: Any, param_names: List[str]
+    params: Any, param_names: List[str], allow_bare: bool = False
 ) -> Tuple[Optional[str], str]:
     if not params:
         return None, P1
     for name in param_names:
         raw = get_action(params, "name", name)
         if raw:
-            build = parse_build_version(raw)
+            build = parse_build_version(raw, allow_bare=allow_bare)
             if build:
                 priority = get_action(params, "name", "priority") or P1
                 if str(priority).upper() not in (P0, P1, P2):
@@ -416,11 +442,25 @@ def add_variants_to_name(doc_name: str, variants: Dict[str, str]) -> str:
 # ---------------------------------------------------------------------------
 
 def get_env_from_params(params: Any, env_param_names: List[str]) -> Optional[str]:
+    """
+    Resolve the Capella environment (PROD / SBX / STAGE / ...) from build params.
+
+    Most env params are an API/UI URL, and the env token is the third-from-last
+    dot-separated label — "https://cloudapi.sbx-29.sandbox.nonprod-...com" -> "sandbox".
+    But some jobs pass the env *directly* (cp-cli-runner sends `Environment = sbx`),
+    and a bare value has fewer than three labels, so the unguarded [-3] raised
+    IndexError. That propagated out of the processor and killed every build of those
+    jobs — which is why cp-cli-runner produced no docs at all. Short values are the
+    env already, so use them as-is.
+    """
+    mapping = {"cloud": "PROD", "sandbox": "SBX"}
     for name in env_param_names:
         val = get_action(params, "name", name)
         if val:
-            raw = val.split(".")[-3].split("/")[-1]
-            mapping = {"cloud": "PROD", "sandbox": "SBX"}
+            labels = str(val).split(".")
+            raw = (labels[-3] if len(labels) >= 3 else labels[0]).split("/")[-1]
+            if not raw:
+                continue
             return mapping.get(raw, raw.upper())
     return None
 
