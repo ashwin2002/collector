@@ -1131,11 +1131,72 @@ class BuildProcessor:
 # CaoProcessor  (cao-testrunner-executor -> `cao` bucket)
 #
 # Unlike the others, CAO has no Jenkins testReport — results live in a
-# `pipeline/results.json` build artifact as a matrix of executions. We fetch that
-# artifact per finished build, normalize it via the pure `cao` module, and write
-# one "cao_run" doc per execution/combo. gb-v2 aggregates these by cbServerVersion
-# in its snapshot layer (no eventing function needed).
+# `results.json` build artifact as a matrix of executions. We fetch that artifact
+# per finished build, normalize it via the pure `cao` module, and write one
+# "cao_run" doc per execution/combo. gb-v2 groups those into jobs + reruns in its
+# snapshot layer (no eventing function needed).
+#
+# Two artifact paths: the dispatcher rework moved results.json to the workspace
+# root, but older builds (and, for a while, new ones too) still publish it under
+# `pipeline/`. Try the new path first and fall back — retention keeps ~5 days of
+# builds, so both shapes are live at once during the transition.
+#
+# The artifact cannot describe its own provenance, so we also read the executor's
+# build parameters: RERUN / RERUN_FROM_BUILD give the rerun chain the board's
+# right sidebar lists, TRIGGER_TYPE / TRIGGER_VERSION say which pivot (CAO or
+# server) kicked the run off, and DISPATCHER_BUILD ties sibling combos together.
 # ---------------------------------------------------------------------------
+
+# Newest path first — both are tried per build, cheapest-correct order.
+CAO_RESULT_PATHS = ("results.json", "pipeline/results.json")
+
+# Executor parameters worth keeping. Anything else (regions, credentials ids,
+# kubectl version) is environment noise that would only bloat every doc.
+_CAO_PARAMS = ("RERUN", "RERUN_FROM_BUILD", "RERUN_SELECTION", "DISPATCHER_BUILD",
+               "TRIGGER_TYPE", "TRIGGER_VERSION", "COMBO_INDEX",
+               "COMPONENT", "SUBCOMPONENT", "PLATFORM")
+
+
+def _cao_build_params(build_url: str) -> Dict[str, str]:
+    """Executor build parameters as a flat dict. Empty on any failure."""
+    data = _jk().get_json(
+        build_url,
+        {"tree": "actions[parameters[name,value]]"},
+    )
+    out: Dict[str, str] = {}
+    for action in (data or {}).get("actions") or []:
+        for param in action.get("parameters") or []:
+            name = param.get("name")
+            if name in _CAO_PARAMS:
+                out[name] = param.get("value")
+    return out
+
+
+def _cao_meta(res: Optional[Dict], params: Dict[str, str]) -> Dict[str, Any]:
+    """Jenkins-side provenance handed to cao.build_cao_docs as `meta`."""
+    def _int(v):
+        try:
+            return int(str(v).strip())
+        except Exception:
+            return None
+
+    rerun_from = _int(params.get("RERUN_FROM_BUILD"))
+    return {
+        "trigger": {
+            "type": str(params.get("TRIGGER_TYPE") or ""),
+            "version": str(params.get("TRIGGER_VERSION") or ""),
+        },
+        "dispatcher_build": _int(params.get("DISPATCHER_BUILD")),
+        "rerun": {
+            # Jenkins hands booleans back as the strings "True"/"False".
+            "is_rerun": str(params.get("RERUN") or "").strip().lower() == "true",
+            "from_build": rerun_from,
+            "selection": str(params.get("RERUN_SELECTION") or ""),
+        },
+        "jenkins_result": (res or {}).get("result") or "",
+        "jenkins_timestamp": (res or {}).get("timestamp") or 0,
+        "jenkins_duration": (res or {}).get("duration") or 0,
+    }
 
 class CaoProcessor:
 
@@ -1166,21 +1227,26 @@ class CaoProcessor:
         if scraped_key in already_scraped:
             return
 
-        status, _ = ServerProcessor._wait_for_build(job_doc.url, bid)
+        status, res = ServerProcessor._wait_for_build(job_doc.url, bid)
         if status == "missing":
             return                         # past retention — nothing here
         if status != "ok":
             return                         # still running / transient — retry next cycle
 
-        artifact = f"{job_doc.url.rstrip('/')}/{bid}/artifact/pipeline/results.json"
-        data = _jk().get_json(artifact, append_api=False)
+        build_url = f"{job_doc.url.rstrip('/')}/{bid}"
+        data = None
+        for path in CAO_RESULT_PATHS:
+            data = _jk().get_json(f"{build_url}/artifact/{path}", append_api=False)
+            if data:
+                break
         if not data:
             # Finished build with no results.json (aborted before publish, etc.).
             # Mark scraped so we don't refetch a permanently-empty build every cycle.
             already_scraped.append(scraped_key)
             return
 
-        docs = cao.build_cao_docs(data, job_doc.url, bid)
+        meta = _cao_meta(res, _cao_build_params(build_url))
+        docs = cao.build_cao_docs(data, job_doc.url, bid, meta=meta)
         wrote = 0
         for d in docs:
             key = storage.make_key(job_doc.name, bid, suffix=f"-{d['combo_index']}")
