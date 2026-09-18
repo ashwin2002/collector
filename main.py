@@ -748,6 +748,83 @@ def push_main(argv: List[str]) -> int:
     return 1
 
 
+def _check_parse_args(argv: List[str]) -> Any:
+    p = argparse.ArgumentParser(
+        prog="main.py check",
+        description="Preflight the push path's configuration: are CB_HOST/CB_USER/"
+                    "CB_PASS set, does the cluster answer, does auth succeed, does the "
+                    "target bucket open? Exits non-zero with a specific reason if not.",
+    )
+    p.add_argument("--bucket", default="server", help="Bucket the push writes to")
+    p.add_argument("--catalog", action="store_true",
+                   help="Also probe the gb_label catalog. Reported as a WARNING, never "
+                        "an error: the catalog failing only costs the board grouping.")
+    return p.parse_args(argv)
+
+
+def check_main(argv: List[str]) -> int:
+    """Entry point for `main.py check`. Returns a process exit code.
+
+    Exists because every way this can be misconfigured is otherwise SILENT and late.
+    CB_PASS unset does not raise at import - config.py defaults it to "" - so the first
+    sign of trouble is a failed upsert, per suite, at the end of a train that has
+    already held a cluster for hours. And the push is wrapped in catchError so that the
+    board being down cannot fail a good test run, which means those failures do not even
+    turn the build red. Run this BEFORE the run instead.
+    """
+    args = _check_parse_args(argv)
+    _push_setup_logging()
+
+    problems: List[str] = []
+
+    # 1. Settings present. Empty CB_PASS is the classic one: config.py:376-378 defaults
+    #    it to "", so the daemon and the push both start happily and fail at the write.
+    logger.info("target cluster : couchbase://%s", config.COUCHBASE_HOST)
+    logger.info("username       : %s", config.COUCHBASE_USER or "(empty)")
+    if not config.COUCHBASE_HOST:
+        problems.append("CB_HOST is empty")
+    if not config.COUCHBASE_USER:
+        problems.append("CB_USER is empty")
+    if not config.COUCHBASE_PASS:
+        problems.append("CB_PASS is empty - export it, or bind it from a Jenkins "
+                        "credential, before running")
+    if problems:
+        for pr in problems:
+            logger.error("MISSING: %s", pr)
+        return 2
+
+    # 2. Cluster reachable, credentials accepted, bucket opens. A KV read of a key that
+    #    cannot exist is the cheapest probe that exercises all three: DocumentNotFound
+    #    means everything worked, anything else is a real problem.
+    try:
+        storage.init_worker(config.COUCHBASE_HOST, config.COUCHBASE_USER,
+                            config.COUCHBASE_PASS)
+        col = storage._col(args.bucket)
+        try:
+            col.get("__greenboard_preflight_probe__")
+        except Exception as exc:
+            if type(exc).__name__ != "DocumentNotFoundException":
+                raise
+    except Exception as exc:
+        logger.error("CANNOT REACH GREENBOARD: %s: %s", type(exc).__name__, exc)
+        logger.error("  checked: couchbase://%s bucket=%s as %s",
+                     config.COUCHBASE_HOST, args.bucket, config.COUCHBASE_USER)
+        return 2
+    logger.info("OK: cluster reachable, auth accepted, bucket '%s' opens", args.bucket)
+
+    # 3. Catalog is advisory only - _load_gb_label_map() already fails soft to {}, which
+    #    costs the gb_label grouping and nothing else. Never fail the build for it.
+    if args.catalog:
+        gb = _load_gb_label_map()
+        if gb:
+            logger.info("OK: gb_label catalog reachable (%d entries)", len(gb))
+        else:
+            logger.warning("WARNING: gb_label catalog at %s returned nothing - pushed "
+                           "docs will group under the raw component",
+                           config.CATALOG_HOST)
+    return 0
+
+
 def run(credentials_path: str = "credentials.ini") -> None:
     _setup_logging()
     logger.info("Greenboard collector starting — poll interval %ds, pool size %d",
@@ -856,5 +933,7 @@ if __name__ == "__main__":
     # existing contract (`main.py` / `main.py credentials.ini`) is untouched.
     if len(sys.argv) > 1 and sys.argv[1] == "push":
         sys.exit(push_main(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "check":
+        sys.exit(check_main(sys.argv[2:]))
     credentials = sys.argv[1] if len(sys.argv) > 1 else "credentials.ini"
     run(credentials)
