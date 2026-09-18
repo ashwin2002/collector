@@ -101,6 +101,15 @@ _EXCLUDE_TMP: List[re.Pattern] = [
     re.compile(r"(_|-)t[e]?mp"),
 ]
 
+# RTAF runs are not wanted on the greenboard server views. Excluded HERE, at
+# discovery, rather than in is_executor(): the name carries the "test_suite_executor"
+# substring, so without this it passes the executor gate in _discover_server_jobs()
+# and its whole build history gets walked. Kept separate from _EXCLUDE_TMP because
+# that list is shared with CAPELLA_VIEW — the views concatenate, never mutate it.
+_EXCLUDE_RTAF: List[re.Pattern] = [
+    re.compile(r"test_suite_executor-RTAF"),
+]
+
 CAPELLA_VIEW = ViewConfig(
     name="capella",
     urls=[
@@ -158,7 +167,7 @@ SERVER_VIEW = ViewConfig(
     platforms=SERVER_PLATFORMS,
     build_param_names=["version_number", "columnar_version_number", "cluster_version",
                        "build", "cbs_ver", "COUCHBASE_SERVER_VERSION", "CB_VERSION"],
-    exclude_patterns=_EXCLUDE_TMP,
+    exclude_patterns=_EXCLUDE_TMP + _EXCLUDE_RTAF,
 )
 
 SERVER_VIEW_2 = ViewConfig(
@@ -168,7 +177,7 @@ SERVER_VIEW_2 = ViewConfig(
     platforms=SERVER_PLATFORMS,
     build_param_names=["version_number", "cluster_version", "build",
                        "COUCHBASE_SERVER_VERSION", "columnar_version_number"],
-    exclude_patterns=_EXCLUDE_TMP,
+    exclude_patterns=_EXCLUDE_TMP + _EXCLUDE_RTAF,
 )
 
 SG_VIEW = ViewConfig(
