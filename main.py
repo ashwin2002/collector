@@ -18,14 +18,20 @@ Environment overrides (all optional — see config.py for defaults):
 """
 from __future__ import annotations
 
+import argparse
+import dataclasses
+import glob
+import json
 import logging
 import multiprocessing
+import os
 import re
 import sys
 import time
 from logging.handlers import TimedRotatingFileHandler
 from threading import Thread
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from xml.etree import ElementTree
 
 import config, storage
 import capella_pipeline as cap
@@ -35,11 +41,15 @@ from models import JobDoc
 from parsing import (
     resolve_capella_platform, resolve_operator_platform,
     is_executor, _os_from_job_name,
+    # push mode
+    compose_test_name, parse_build_version, get_variants, add_variants_to_name,
 )
 from processors import (
     ProcessTask,
     ServerProcessor, CapellaProcessor, OperatorProcessor, BuildProcessor, CaoProcessor,
     set_jenkins_client, set_gb_label_map,
+    # push mode — reused so the pushed doc matches a polled one field for field
+    _lookup_gb_label, _update_skip_count,
 )
 
 # ---------------------------------------------------------------------------
@@ -429,6 +439,315 @@ def _convert_changelog(doc: Dict, timestamp: int) -> Dict:
 # Main loop
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# One-shot push mode  —  `python3 main.py push ...`
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS
+# ─────────────────
+# test_suite_executor-RTAF cannot be polled, and not because of a bug. Its pipeline is
+# a "train": ONE Jenkins build runs N suites sequentially against one shared cluster.
+# The poller derives exactly one name per build, and RTAF publishes no Jenkins
+# testReport, so a polled RTAF build lands as a single document named after a raw JSON
+# map ('debian-rosetta_{"rqg_1.0": "conf/rosetta/rqg.conf"}') carrying 0/0 counts.
+# One build must instead become N documents. So RTAF is excluded from the server views
+# (config._EXCLUDE_RTAF) and pushes its own result once per suite, from inside the train
+# loop in JenkinsFile_Rosetta_Pipeline.
+#
+# PARITY IS THE WHOLE GAME
+# ─────────────────────────
+# This re-enters the SAME document assembly the poller uses — the tail of
+# ServerProcessor._process_build. The doc key is md5(name-build_id), so any divergence
+# in naming does not error, it silently starts a SECOND history for the same job. Every
+# non-obvious parity point below is commented where it happens; the full derivation is
+# in docs/rtaf_self_report.md.
+#
+# Deliberately NOT reused from the poller:
+#   _setup_logging()      — see _push_setup_logging()
+#   set_jenkins_client()  — the push path never calls Jenkins. The only part of the
+#                           reused tail that would is _get_claim() (console scraping),
+#                           which is skipped: result and counts are already known here.
+
+_PUSH_RESULT_MAP = {
+    "PASSED":  "SUCCESS", "PASS": "SUCCESS", "SUCCESS":  "SUCCESS",
+    "FAILED":  "FAILURE", "FAIL": "FAILURE", "FAILURE":  "FAILURE",
+    "ABORTED": "ABORTED", "UNSTABLE": "UNSTABLE",
+}
+
+
+def _push_setup_logging() -> None:
+    """Plain stdout logging — deliberately NOT _setup_logging().
+
+    _setup_logging() installs two TimedRotatingFileHandlers writing collector.log and
+    collector_errors.log into the CWD. That is right for a long-lived daemon and wrong
+    for a one-shot run on a Jenkins agent, where it would drop rotating files into the
+    build workspace and hide the output from the console log.
+    """
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+    root.addHandler(handler)
+
+
+def _sum_junit_counts(logs_dir: str) -> Tuple[int, int, int, int]:
+    """Sum every report-*.xml in ONE testrunner log directory.
+
+    RTAF's XUnitTestResult.write() (taf/lib/framework_lib/xunit.py) loops over its
+    suites and emits one file PER TEST CLASS — not one per greenboard suite. A single
+    conf run routinely produces six, e.g.
+
+        logs/testrunner-26-Jul-31_15-59-06/
+            report-...-RosettaAggregationTest.xml
+            report-...-RosettaAppHealthTest.xml
+            ... four more ...
+
+    so reading a single file would report a sixth of the tests. The whole directory is
+    summed instead, which is why the CLI takes --logs-dir and not a file path.
+
+    `failures` and `errors` are incremented TOGETHER for the same failing test (see
+    XUnitTestCase.update_results), so they are always equal and summing both would
+    double-count. Only `failures` is used.
+
+    Returns (tests, failures, skips, files_read).
+    """
+    tests = failures = skips = files_read = 0
+    for path in sorted(glob.glob(os.path.join(logs_dir, "report-*.xml"))):
+        try:
+            root = ElementTree.parse(path).getroot()
+        except Exception as exc:
+            logger.warning("unreadable JUnit XML, skipped: %s (%s)", path, exc)
+            continue
+
+        def _attr(name: str) -> int:
+            try:
+                return int(root.get(name) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        tests    += _attr("tests")
+        failures += _attr("failures")
+        skips    += _attr("skip")      # the attribute is 'skip', not 'skipped'
+        files_read += 1
+    return tests, failures, skips, files_read
+
+
+def _push_build_doc(args: Any) -> Optional[JobDoc]:
+    """Assemble one greenboard document, mirroring ServerProcessor._process_build."""
+    # --- build version ------------------------------------------------------
+    # Normalised, never raw: parse_build_version() zero-pads the build number
+    # (8.5.0-115 -> 8.5.0-0115) and rejects junk. The poller bails when this is falsy
+    # ("if not doc.build: return"); so does this, or the doc lands unfindable.
+    build = parse_build_version(args.version)
+    if not build:
+        logger.error("unusable --version %r — expected X.Y.Z-NNNN", args.version)
+        return None
+
+    doc = JobDoc(name=args.job, url=args.url, color=None)
+    # doc.url stays the JOB url. _process_build never reassigns job_doc.url, so the
+    # stored url is the job's, and the build link is composed downstream from
+    # url + build_id. Passing $BUILD_URL here would compose to ".../85/85".
+    # doc.color stays None: the poller reads it from the Jenkins job listing, which a
+    # push has no equivalent of. to_dict() emits color: null.
+    doc.build_id  = args.build
+    doc.build     = build
+    raw_result    = args.result.strip().upper()
+    doc.result    = _PUSH_RESULT_MAP.get(raw_result, raw_result)
+    doc.duration  = args.duration_ms
+    doc.timestamp = args.timestamp_ms or int(time.time() * 1000)
+
+    # --- counts -------------------------------------------------------------
+    tests, failures, skips, files_read = _sum_junit_counts(args.logs_dir)
+    if files_read == 0:
+        # The suite died before writing any report. Still pushed: the poller keeps
+        # executor builds whose totalCount is 0, and a visible 0/0 row is far better
+        # than a silently absent suite (the push is now RTAF's ONLY source).
+        logger.warning("no report-*.xml under %s — pushing with zero counts", args.logs_dir)
+    # Mirrors _process_build exactly on both halves:
+    #   total is NET of skips, and doc.skip_count is deliberately left at 0 here.
+    # The poller likewise never stores Jenkins' skipCount directly — only
+    # _update_skip_count() populates doc.skip_count, from the expected-count
+    # reconciliation below.
+    doc.total_count = max(tests - skips, 0)
+    doc.fail_count  = failures
+    logger.info("counts from %d file(s): tests=%d failures=%d skip=%d -> total=%d fail=%d",
+                files_read, tests, failures, skips, doc.total_count, doc.fail_count)
+
+    # --- identity -----------------------------------------------------------
+    # Case is NOT uniform here, and that is deliberate. resolve_os_and_component()
+    # upper-cases os/component onto the doc, while the NAME is composed from the raw,
+    # lower-case params. One poller-written doc carries both spellings:
+    #     os=DEBIAN  component=ROSETTA  name=debian-rosetta_rqg_1.0...
+    # Upper-casing the name would rename every RTAF job and fork its history; lowering
+    # os/component would move it out of its board section.
+    doc.name = compose_test_name(args.os, args.component, args.subcomponent, args.arch)
+    if not doc.name:
+        logger.error("could not compose a test name — --component is required")
+        return None
+    doc.os        = args.os.upper()
+    doc.component = args.component.upper()
+    # ServerProcessor never sets sub_component (only CapellaProcessor does), so no other
+    # server doc carries it. Set knowingly: it is exactly what the field exists for —
+    # a mis-keyed run stays repairable offline once Jenkins has aged the build out.
+    doc.sub_component = args.subcomponent
+
+    # arch appears TWICE in the poller: once inside the name (handled by
+    # compose_test_name above) and again on doc.os. Both, or neither matches.
+    if args.arch and args.arch != config.DEFAULT_ARCHITECTURE:
+        doc.os = f"{doc.os}-{args.arch}"
+    if args.server_type and args.server_type != config.DEFAULT_SERVER_TYPE:
+        doc.os = args.server_type.upper()
+    # Windows variants collapse to WIN on the server board (executors report
+    # "windows22"/"WINDOWS"); without this they split into their own section.
+    if args.bucket == "server" and doc.os and doc.os.upper().startswith("WIN"):
+        doc.os = "WIN"
+
+    priority = (args.priority or config.P1).upper()
+    doc.priority = priority if priority in (config.P0, config.P1, config.P2) else config.P1
+
+    # gb_label — curated board section, keyed on the RAW (component, subcomponent)
+    # params exactly as the poller keys it. Absent => the board groups under `component`.
+    gb = _lookup_gb_label(args.component, args.subcomponent)
+    if gb:
+        doc.gb_label = gb
+
+    # --- variants -----------------------------------------------------------
+    # get_variants() reads the free-form `parameters` string out of a Jenkins actions
+    # array; rebuild the minimal shape it expects rather than duplicating its defaults
+    # (bucket_storage=COUCHSTORE, and GSI_type=PLASMA only for GSI components —
+    # 'rosetta' is not one, so UNDEFINED). Passing doc.component (upper-case) matches
+    # the poller, which calls this after the upper-casing above.
+    synth_params = [{"name": "parameters", "value": args.parameters}] if args.parameters else []
+    doc.variants     = get_variants(synth_params, doc.component)
+    doc.display_name = doc.name
+    doc.name         = add_variants_to_name(doc.name, doc.variants)
+
+    # doc.claim stays "": _get_claim() scrapes the Jenkins console, and this path has no
+    # Jenkins client by design. The failure reason is in the suite's own logs.
+    return doc
+
+
+def _push_supersede(bucket: str, doc: JobDoc) -> None:
+    """Delete docs from OLDER builds resolving to the same (name, build-version).
+
+    The server board's rule is one run per (name, build): a rerun supersedes. The poller
+    enforces it by deleting the loser mid-walk (ServerProcessor._process_build), which a
+    one-shot push cannot see — it knows only its own build.
+
+    OFF BY DEFAULT (--supersede). It needs the `server` bucket to serve name+build
+    without a full scan, which is unverified. See docs/rtaf_self_report.md section 7b.
+    storage.query() already swallows and logs query errors, so a missing index degrades
+    to "no supersession" rather than a failed push.
+    """
+    rows = storage.query(
+        f"SELECT build_id FROM `{bucket}` WHERE name = $1 AND build = $2 AND build_id < $3",
+        doc.name, doc.build, doc.build_id,
+    )
+    for row in rows:
+        try:
+            old_bid = int(row["build_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if storage.remove(bucket, storage.make_key(doc.name, old_bid)):
+            logger.info("superseded older run of %s: build %d", doc.name, old_bid)
+
+
+def _push_parse_args(argv: List[str]) -> Any:
+    p = argparse.ArgumentParser(
+        prog="main.py push",
+        description="Push one already-run test suite into greenboard. For jobs that "
+                    "cannot be polled because one Jenkins build produces many suites "
+                    "(RTAF's train pipeline).",
+    )
+    p.add_argument("--logs-dir", required=True,
+                   help="Directory holding this suite's report-*.xml files, e.g. "
+                        "RTAF/logs/testrunner-<ts>/. ALL of them are summed.")
+    p.add_argument("--job", required=True, help="Jenkins job name ($JOB_NAME)")
+    p.add_argument("--build", required=True, type=int, help="Build number ($BUILD_NUMBER)")
+    p.add_argument("--url", required=True,
+                   help="Jenkins JOB url ($JOB_URL) — NOT $BUILD_URL. The build link is "
+                        "composed downstream from url + build_id.")
+    p.add_argument("--os", required=True, help="e.g. debian (case as the param has it)")
+    p.add_argument("--component", required=True, help="e.g. rosetta")
+    p.add_argument("--subcomponent", required=True, help="the suite name, e.g. rqg_1.0")
+    p.add_argument("--version", required=True, help="Server build under test, X.Y.Z-NNNN")
+    p.add_argument("--result", required=True,
+                   help="PASSED/FAILED (or SUCCESS/FAILURE/ABORTED/UNSTABLE)")
+    p.add_argument("--arch", default="", help="CPU arch; only non-default is appended")
+    p.add_argument("--server-type", default="", help="Overrides OS when non-default")
+    p.add_argument("--parameters", default="",
+                   help="Test-runner parameter string, source of the bucket_storage / "
+                        "gsi_type variants")
+    p.add_argument("--priority", default="", help="P0/P1/P2 (default P1)")
+    p.add_argument("--bucket", default="server", help="Target bucket (default: server)")
+    p.add_argument("--duration-ms", type=int, default=0, help="Suite duration in ms")
+    p.add_argument("--timestamp-ms", type=int, default=0,
+                   help="Suite start in epoch ms (default: now)")
+    p.add_argument("--supersede", action="store_true",
+                   help="Delete older builds' docs for the same (name, build-version). "
+                        "Off by default — see _push_supersede().")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Compose and print the document; touch Couchbase not at all.")
+    return p.parse_args(argv)
+
+
+def push_main(argv: List[str]) -> int:
+    """Entry point for `main.py push`. Returns a process exit code."""
+    args = _push_parse_args(argv)
+    _push_setup_logging()
+
+    if not os.path.isdir(args.logs_dir):
+        logger.error("--logs-dir is not a directory: %s", args.logs_dir)
+        return 2
+
+    if args.dry_run:
+        set_gb_label_map({})
+    else:
+        storage.init_worker(config.COUCHBASE_HOST, config.COUCHBASE_USER,
+                            config.COUCHBASE_PASS)
+        # The poller loads this once in the parent process and ships it into each worker
+        # through _worker_init(); a one-shot run gets neither, so without this every
+        # pushed doc would carry no gb_label and group under the raw component forever.
+        # Best-effort by design: an unreachable catalog yields {} and costs the grouping,
+        # not the push.
+        set_gb_label_map(_load_gb_label_map())
+
+    doc = _push_build_doc(args)
+    if doc is None:
+        return 2
+
+    if args.dry_run:
+        logger.info("dry run — no Couchbase writes. key would be %s",
+                    storage.make_key(doc.name, doc.build_id))
+        print(json.dumps(doc.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    # _update_skip_count reads only view.bucket; reuse the real qe-jenkins1 server view
+    # so any future change to it applies here too.
+    view = (config.SERVER_VIEW_2 if args.bucket == config.SERVER_VIEW_2.bucket
+            else dataclasses.replace(config.SERVER_VIEW_2, bucket=args.bucket))
+    _update_skip_count(doc, view)
+
+    doc.triage, doc.bugs = storage.get_triage_and_bugs(
+        args.bucket, doc.display_name or doc.name, doc.build or "")
+
+    if args.supersede:
+        _push_supersede(args.bucket, doc)
+
+    key = storage.make_key(doc.name, doc.build_id)
+    # storage.upsert() already retries 5x internally; upsert is idempotent on this key,
+    # so a retried Jenkins stage re-pushing the same suite is harmless.
+    if storage.upsert(args.bucket, key, doc.to_dict()):
+        logger.info("pushed %s (build %d) -> %s/%s", doc.name, doc.build_id, args.bucket, key)
+        return 0
+
+    # Loud, not silent: with the poller exclusion in place this push is the ONLY source
+    # of this suite's result. A swallowed failure is a permanently missing row.
+    logger.error("PUSH FAILED after retries — %s (build %d) -> %s/%s",
+                 doc.name, doc.build_id, args.bucket, key)
+    return 1
+
+
 def run(credentials_path: str = "credentials.ini") -> None:
     _setup_logging()
     logger.info("Greenboard collector starting — poll interval %ds, pool size %d",
@@ -532,5 +851,10 @@ def run(credentials_path: str = "credentials.ini") -> None:
 
 
 if __name__ == "__main__":
+    # Subcommand, not a flag: argv[1] is the daemon's credentials path and has been
+    # since this file existed. "push" can never be a credentials filename, so the
+    # existing contract (`main.py` / `main.py credentials.ini`) is untouched.
+    if len(sys.argv) > 1 and sys.argv[1] == "push":
+        sys.exit(push_main(sys.argv[2:]))
     credentials = sys.argv[1] if len(sys.argv) > 1 else "credentials.ini"
     run(credentials)

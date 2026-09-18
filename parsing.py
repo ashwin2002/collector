@@ -231,15 +231,49 @@ def resolve_os_and_component(
     return os_name, component
 
 
+def compose_test_name(
+    os_name: Optional[str],
+    component: Optional[str],
+    subcomponent: Optional[str],
+    arch: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Compose the per-test identity: "<os>-<component>_<subcomponent>".
+
+    Pure string composition, deliberately kept free of Jenkins `params` so that the
+    polling path (build_test_name(), below) and the one-shot push path
+    (main.py `push`, used by RTAF, which has no pollable testReport) share exactly ONE
+    source of truth for naming. Two implementations would drift, and a drifted name is
+    unrecoverable: the doc key is md5(name-build_id), so a renamed job silently starts a
+    second history instead of erroring.
+
+    Values are used AS GIVEN — no case folding. The historical greenboard names are
+    lower-case ("debian-2i_gsi-composite-vector"), while doc.os / doc.component are
+    upper-cased by resolve_os_and_component(). Both spellings coexist on one doc by
+    design; normalising here would rename every executor job.
+
+    Returns None when there is no component — the caller should then leave the Jenkins
+    job name untouched.
+    """
+    if not component:
+        return None
+    os_part = os_name or ""
+    if arch and arch != DEFAULT_ARCHITECTURE:
+        os_part = f"{os_part}-{arch}"
+    return f"{os_part}-{component}_{subcomponent or 'server'}"
+
+
 def build_test_name(params: Any, fallback_os: Optional[str] = None) -> Optional[str]:
     """
-    Per-test identity for executor builds.
+    Per-test identity for executor builds, read out of Jenkins build params.
 
     `test_suite_executor` is ONE Jenkins job that runs every suite; the actual test
     is identified by its `component` + `subcomponent` params. Reconstruct the name the
     original collector used — "<os>-<component>_<subcomponent>" from the raw param
     values, so it matches the historical greenboard job names (e.g. the lowercase
     "debian-2i_gsi-composite-vector").
+
+    Param extraction only — the composition itself lives in compose_test_name().
 
     Returns None when there is no component param (a normally-named job) — caller
     should then leave the Jenkins job name untouched.
@@ -252,6 +286,11 @@ def build_test_name(params: Any, fallback_os: Optional[str] = None) -> Optional[
             stem = _os.path.splitext(_os.path.basename(test_yml.split()[-1]))[0]
             component = f"systest-{stem}"
     if not component:
+        # Early out, exactly as before compose_test_name() was extracted. Nothing below
+        # is reachable without a component, and this is the common path: every
+        # non-executor build the poller walks lands here, so the lookups below would be
+        # pure waste. compose_test_name() returns None for a falsy component anyway --
+        # this keeps the WORK done identical, not just the result.
         return None
 
     os_param = (
@@ -259,11 +298,12 @@ def build_test_name(params: Any, fallback_os: Optional[str] = None) -> Optional[
         get_action(params, "name", "os") or
         fallback_os or ""
     )
-    arch = get_action(params, "name", "arch")
-    if arch and arch != DEFAULT_ARCHITECTURE:
-        os_param = f"{os_param}-{arch}"
-    subcomponent = get_action(params, "name", "subcomponent") or "server"
-    return f"{os_param}-{component}_{subcomponent}"
+    return compose_test_name(
+        os_param,
+        component,
+        get_action(params, "name", "subcomponent"),
+        get_action(params, "name", "arch"),
+    )
 
 
 def _os_from_job_name(name: str, view: ViewConfig) -> Optional[str]:
